@@ -31,14 +31,49 @@ import xml.etree.ElementTree as ET
 from http.cookiejar import MozillaCookieJar
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
+from pathlib import Path
 import mysql.connector
 from mysql.connector import Error
 import requests
 from dotenv import load_dotenv
 
+# --- CẤU HÌNH LOGGING ---
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
+
 # Load biến môi trường từ file .env (dùng đường dẫn tuyệt đối)
-env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-load_dotenv(dotenv_path=env_path)
+script_dir = Path(__file__).resolve().parent
+env_path = script_dir / '.env'
+
+logger.info(f"🔍 Đang tìm file .env tại: {env_path}")
+
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+    logger.info("✅ Đã tải thành công file .env")
+    
+    # DEBUG: In ra các biến vừa tải (che mật khẩu)
+    db_user = os.getenv('MYSQL_USER')
+    db_pass = os.getenv('MYSQL_PASSWORD')
+    db_host = os.getenv('MYSQL_HOST')
+    db_name = os.getenv('MYSQL_DATABASE')
+    
+    logger.info(f"📊 DB Host: {db_host}")
+    logger.info(f"📊 DB User: {db_user}")
+    logger.info(f"📊 DB Pass: {'*' * len(db_pass) if db_pass else 'None'}")
+    logger.info(f"📊 DB Name: {db_name}")
+    
+    if not db_pass:
+        logger.error("❌ CẢNH BÁO: MYSQL_PASSWORD không tìm thấy trong .env!")
+else:
+    logger.error(f"❌ KHÔNG TÌM THẤY file .env tại {env_path}")
+    logger.error("Vui lòng tạo file .env từ .env.example")
+    sys.exit(1)
 
 # ============================================================================
 # CẤU HÌNH
