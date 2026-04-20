@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
 """
-YouTube Transcript Processor - Phiên bản Python thuần
+YouTube Transcript Processor - Phiên bản Python thuần với Qwen AI
 Lấy transcript từ YouTube, chia đoạn có ngữ cảnh, tạo quote và caption bằng AI
+
+Cấu trúc project:
+craw_youtube_videos/
+├── .env.example          # File mẫu cấu hình môi trường
+├── requirements.txt      # Danh sách dependencies
+├── youtube_processor.py  # Script chính xử lý toàn bộ
+├── ids.txt              # File chứa danh sách video IDs (tuỳ chọn)
+└── README.md            # Hướng dẫn sử dụng
+
+Cách chạy:
+1. Cài đặt dependencies: pip install -r requirements.txt
+2. Tạo file .env từ .env.example và điền thông tin
+3. Chạy script:
+   - python youtube_processor.py [VIDEO_ID]
+   - python youtube_processor.py --file ids.txt
+   - python youtube_processor.py --all (xử lý tất cả video chưa có transcript)
 """
 
 import os
@@ -13,17 +29,17 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from http.cookiejar import MozillaCookieJar
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime
 import mysql.connector
 from mysql.connector import Error
-from openai import OpenAI
 import requests
 
 # ============================================================================
 # CẤU HÌNH
 # ============================================================================
 
-SKIP_TEXTS = {"[music]", "[âm nhạc]", "[nhạc]", "[tiếng nhạc]", "♪", "♫"}
+SKIP_TEXTS = {"[music]", "[âm nhạc]", "[nhạc]", "[tiếng nhạc]", "♪", "♫", ""}
 DEFAULT_LANGS = ["vi", "en"]
 
 # Cấu hình chia đoạn
@@ -45,915 +61,940 @@ MYSQL_CONFIG = {
 }
 
 # API Keys
-GEMINI_API_KEYS = [
-    "AIzaSyBIsSyFNutubWm9_ANjXBM4l9eN1_wIhio",
-]
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # ============================================================================
-# MYSQL CONNECTION
+# HELPER FUNCTIONS
 # ============================================================================
 
-def get_mysql_connection():
+
+def log(msg: str, level: str = "INFO"):
+    """Ghi log với timestamp"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {msg}")
+
+
+def clean_text(text: str) -> str:
+    """Làm sạch text: decode HTML entities, chuẩn hóa khoảng trắng"""
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def get_db_connection():
     """Tạo kết nối MySQL"""
     try:
         conn = mysql.connector.connect(**MYSQL_CONFIG)
-        return conn
+        if conn.is_connected():
+            log("Kết nối MySQL thành công")
+            return conn
     except Error as e:
-        print(f"❌ Lỗi kết nối MySQL: {e}")
+        log(f"Lỗi kết nối MySQL: {e}", "ERROR")
         return None
-
-
-def fetch_video_by_id(conn, video_id: str) -> Optional[Dict]:
-    """Lấy thông tin video từ DB"""
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM youtube_videos WHERE video_id = %s", (video_id,))
-    result = cursor.fetchone()
-    cursor.close()
-    return result
-
-
-def fetch_videos_without_quotes(conn, limit: int = 100) -> List[Dict]:
-    """Lấy danh sách video chưa có quotes"""
-    cursor = conn.cursor(dictionary=True)
-    query = """
-        SELECT v.* FROM youtube_videos v
-        LEFT JOIN youtube_quotes q ON v.id = q.youtube_video_id
-        WHERE q.id IS NULL AND v.video_id IS NOT NULL
-        LIMIT %s
-    """
-    cursor.execute(query, (limit,))
-    results = cursor.fetchall()
-    cursor.close()
-    return results
-
-
-def delete_existing_paragraphs(conn, video_db_id: int):
-    """Xóa paragraphs cũ của video"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "DELETE FROM youtube_paragraphs WHERE youtube_video_id = %s",
-        (video_db_id,)
-    )
-    conn.commit()
-    cursor.close()
-
-
-def delete_existing_quotes(conn, video_db_id: int):
-    """Xóa quotes cũ của video"""
-    cursor = conn.cursor()
-    cursor.execute(
-        "DELETE FROM youtube_quotes WHERE youtube_video_id = %s",
-        (video_db_id,)
-    )
-    conn.commit()
-    cursor.close()
-
-
-def save_paragraph(conn, video_db_id: int, ordinal: int, content_raw: str, content: str):
-    """Lưu paragraph vào DB"""
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO youtube_paragraphs 
-           (youtube_video_id, ordinal_number, content_raw, content, created_at, updated_at)
-           VALUES (%s, %s, %s, %s, NOW(6), NOW(6))""",
-        (video_db_id, ordinal, content_raw, content)
-    )
-    conn.commit()
-    cursor.close()
-
-
-def save_quote(conn, video_db_id: int, ordinal: int, content: str, is_visible: bool = True):
-    """Lưu quote vào DB"""
-    cursor = conn.cursor()
-    cursor.execute(
-        """INSERT INTO youtube_quotes 
-           (youtube_video_id, ordinal_number, content, is_visible, created_at, updated_at)
-           VALUES (%s, %s, %s, %s, NOW(6), NOW(6))""",
-        (video_db_id, ordinal, content, is_visible)
-    )
-    conn.commit()
-    cursor.close()
+    return None
 
 
 # ============================================================================
-# TRANSCRIPT FETCHING (giữ nguyên logic từ fetch_transcript.py)
+# YOUTUBE TRANSCRIPT FETCHER
 # ============================================================================
 
-def build_proxy_config():
-    http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-    https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-    if not http_proxy and not https_proxy:
-        return None
-    return {"http": http_proxy, "https": https_proxy}
 
+class YouTubeTranscriptFetcher:
+    """Class để lấy transcript từ YouTube"""
 
-def build_http_client():
-    session = requests.Session()
-    session.headers.update({"Accept-Language": "en-US,en;q=0.9,vi;q=0.8"})
-    
-    cookie_file = os.getenv("YOUTUBE_COOKIE_FILE")
-    if cookie_file and os.path.exists(cookie_file):
-        cookie_jar = MozillaCookieJar()
-        cookie_jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
-        session.cookies = cookie_jar
-    
-    return session
+    def __init__(self, cookie_file: Optional[str] = None):
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            }
+        )
 
+        if cookie_file and os.path.exists(cookie_file):
+            cookie_jar = MozillaCookieJar()
+            cookie_jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
+            self.session.cookies = cookie_jar
+            log(f"Đã load cookies từ {cookie_file}")
 
-def normalize_segments(items: List[Dict], language: str, video_id: str = None) -> Dict:
-    segments = []
-    full_text = []
-
-    for item in items:
-        text = item.get("text", "").strip()
-        if not text or text.lower() in SKIP_TEXTS:
-            continue
+    def fetch_transcript(self, video_id: str, langs: List[str] = None) -> Optional[List[Dict]]:
+        """
+        Lấy transcript từ YouTube
         
-        segments.append({
-            "start": float(item.get("start", 0)),
-            "duration": float(item.get("duration", 0)),
-            "text": text
-        })
-        full_text.append(text)
+        Args:
+            video_id: ID của video YouTube
+            langs: Danh sách ngôn ngữ ưu tiên
+            
+        Returns:
+            List of dicts với keys: text, start, duration
+            hoặc None nếu không tìm thấy
+        """
+        if langs is None:
+            langs = DEFAULT_LANGS
 
-    return {
-        "video_id": video_id,
-        "language": language,
-        "segments": segments,
-        "transcript": "\n".join(full_text)
-    }
+        log(f"Đang lấy transcript cho video {video_id}, languages: {langs}")
+
+        try:
+            # Bước 1: Lấy watch page để tìm transcript URL
+            watch_url = f"https://www.youtube.com/watch?v={video_id}"
+            response = self.session.get(watch_url, timeout=10)
+            response.raise_for_status()
+
+            # Tìm transcript URL trong page
+            transcript_url = self._extract_transcript_url(response.text)
+            if not transcript_url:
+                log(f"Không tìm thấy transcript URL cho video {video_id}", "WARNING")
+                return None
+
+            # Bước 2: Lấy transcript từ URL
+            transcript_response = self.session.get(transcript_url, timeout=10)
+            transcript_response.raise_for_status()
+
+            # Parse XML transcript
+            segments = self._parse_transcript_xml(transcript_response.text, langs)
+            
+            if segments:
+                log(f"Đã lấy được {len(segments)} segments cho video {video_id}")
+                return segments
+            else:
+                log(f"Không có segment nào phù hợp ngôn ngữ cho video {video_id}", "WARNING")
+                return None
+
+        except requests.RequestException as e:
+            log(f"Lỗi HTTP khi lấy transcript: {e}", "ERROR")
+            return None
+        except Exception as e:
+            log(f"Lỗi không xác định khi lấy transcript: {e}", "ERROR")
+            return None
+
+    def _extract_transcript_url(self, html_content: str) -> Optional[str]:
+        """Trích xuất transcript URL từ HTML watch page"""
+        # Tìm transcript baseUrl trong captions array
+        patterns = [
+            r'"baseUrl":"([^"]+)"',
+            r'"transcriptUrl":"([^"]+)"',
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content)
+            for match in matches:
+                url = match.replace("\\u0026", "&")
+                if "transcript" in url or "timedtext" in url:
+                    return url
+
+        # Thử tìm trong JSON data
+        try:
+            json_start = html_content.find('"captions":')
+            if json_start != -1:
+                json_end = html_content.find("};", json_start) + 1
+                if json_end > json_start:
+                    json_str = html_content[json_start:json_end]
+                    data = json.loads(json_str)
+                    if "captions" in data:
+                        renderer = data["captions"].get("playerCaptionsTracklistRenderer", {})
+                        tracks = renderer.get("captionTracks", [])
+                        for track in tracks:
+                            if "baseUrl" in track:
+                                return track["baseUrl"]
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+        return None
+
+    def _parse_transcript_xml(self, xml_content: str, langs: List[str]) -> List[Dict]:
+        """Parse XML transcript và lọc theo ngôn ngữ"""
+        try:
+            root = ET.fromstring(xml_content)
+            segments = []
+
+            # Kiểm tra xem có phải là list ngôn ngữ không
+            if root.tag == "transcript_list":
+                # Tìm track phù hợp với ngôn ngữ ưu tiên
+                for lang in langs:
+                    track = root.find(f'.//track[@lang_code="{lang}"]')
+                    if track is not None and "url" in track.attrib:
+                        # Load transcript từ URL của track đó
+                        url = track.attrib["url"]
+                        response = self.session.get(url, timeout=10)
+                        response.raise_for_status()
+                        return self._parse_transcript_xml(response.text, [])
+
+            elif root.tag == "transcript":
+                for child in root:
+                    if child.tag == "text":
+                        text = child.text or ""
+                        if text.strip() and text.strip().lower() not in SKIP_TEXTS:
+                            start = float(child.get("start", 0))
+                            duration = float(child.get("dur", 0))
+                            segments.append({
+                                "text": clean_text(text),
+                                "start": start,
+                                "duration": duration,
+                            })
+
+            return segments
+
+        except ET.ParseError as e:
+            log(f"Lỗi parse XML transcript: {e}", "ERROR")
+            return []
+
+    def fetch_from_api(self, video_id: str, langs: List[str] = None) -> Optional[List[Dict]]:
+        """Fallback: Sử dụng youtube-transcript-api nếu có"""
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+            
+            if langs is None:
+                langs = DEFAULT_LANGS
+
+            log(f"Đang thử youtube-transcript-api cho video {video_id}")
+            
+            # Thử lấy transcript với language preferences
+            for lang in langs:
+                try:
+                    transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
+                    if transcript:
+                        segments = [
+                            {
+                                "text": clean_text(seg["text"]),
+                                "start": seg["start"],
+                                "duration": seg["duration"],
+                            }
+                            for seg in transcript
+                            if seg["text"].strip().lower() not in SKIP_TEXTS
+                        ]
+                        if segments:
+                            log(f"Đã lấy được {len(segments)} segments qua API")
+                            return segments
+                except Exception:
+                    continue
+
+            # Thử lấy transcript mặc định
+            transcript = YouTubeTranscriptApi.get_transcript(video_id)
+            segments = [
+                {
+                    "text": clean_text(seg["text"]),
+                    "start": seg["start"],
+                    "duration": seg["duration"],
+                }
+                for seg in transcript
+                if seg["text"].strip().lower() not in SKIP_TEXTS
+            ]
+            
+            if segments:
+                log(f"Đã lấy được {len(segments)} segments qua API (default)")
+                return segments
+
+            return None
+
+        except ImportError:
+            log("youtube-transcript-api không được cài đặt", "WARNING")
+            return None
+        except Exception as e:
+            log(f"Lỗi khi dùng youtube-transcript-api: {e}", "ERROR")
+            return None
 
 
-def fetch_url(url: str) -> str:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            "Accept-Language": "en-US,en;q=0.9,vi;q=0.8"
+# ============================================================================
+# PARAGRAPH SPLITTER
+# ============================================================================
+
+
+class ParagraphSplitter:
+    """Chia transcript thành các đoạn có ý nghĩa với ngữ cảnh"""
+
+    def __init__(self, config: Dict = None):
+        self.config = config or PARAGRAPH_CONFIG
+
+    def split(self, segments: List[Dict]) -> List[Dict]:
+        """
+        Chia segments thành paragraphs có ngữ cảnh
+        
+        Logic:
+        1. Gom các segments liên tiếp thành paragraph
+        2. Không cắt ngang câu (tôn trọng dấu câu: . ! ?)
+        3. Tôn trọng khoảng nghỉ >= break_gap_seconds
+        4. Đảm bảo mỗi paragraph có độ dài phù hợp (min_bytes - max_bytes)
+        
+        Returns:
+            List of dicts với keys: content_raw, ordinal_number
+        """
+        if not segments:
+            return []
+
+        paragraphs = []
+        current_paragraph = []
+        current_length = 0
+
+        for i, segment in enumerate(segments):
+            text = segment["text"]
+            duration = segment["duration"]
+            start = segment["start"]
+            
+            # Tính độ dài byte (UTF-8)
+            text_bytes = len(text.encode("utf-8"))
+            
+            # Kiểm tra xem có nên bắt đầu paragraph mới không
+            should_break = False
+            
+            # Nếu paragraph hiện tại đã vượt max_bytes
+            if current_length + text_bytes > self.config["max_bytes"]:
+                should_break = True
+            
+            # Nếu có khoảng nghỉ lớn giữa các segments
+            if i > 0 and current_paragraph:
+                prev_segment = segments[i - 1]
+                gap = start - (prev_segment["start"] + prev_segment["duration"])
+                if gap >= self.config["break_gap_seconds"]:
+                    should_break = True
+            
+            # Nếu đã đến target_bytes và gặp dấu câu kết thúc câu
+            if current_length >= self.config["target_bytes"]:
+                if text.endswith((".", "!", "?", ".\"", "!\"", "?\"")):
+                    should_break = True
+            
+            # Break nếu cần
+            if should_break and current_paragraph:
+                # Chỉ break nếu đang ở cuối câu hoặc gần cuối câu
+                if self._is_good_break_point(current_paragraph):
+                    paragraphs.append(self._build_paragraph(paragraphs, current_paragraph))
+                    current_paragraph = []
+                    current_length = 0
+            
+            # Thêm segment vào paragraph hiện tại
+            current_paragraph.append(segment)
+            current_length += text_bytes
+
+        # Thêm paragraph cuối cùng
+        if current_paragraph:
+            paragraphs.append(self._build_paragraph(paragraphs, current_paragraph))
+
+        log(f"Đã chia thành {len(paragraphs)} paragraphs")
+        return paragraphs
+
+    def _is_good_break_point(self, segments: List[Dict]) -> bool:
+        """Kiểm tra xem có phải điểm break tốt không (cuối câu)"""
+        if not segments:
+            return True
+        
+        last_text = segments[-1]["text"]
+        return last_text.rstrip().endswith((".", "!", "?", ".\"", "!\"", "?\"", "..."))
+
+    def _build_paragraph(self, existing_paragraphs: List[Dict], segments: List[Dict]) -> Dict:
+        """Xây dựng paragraph từ segments"""
+        ordinal = len(existing_paragraphs) + 1
+        
+        # Nối các segments lại
+        texts = [seg["text"] for seg in segments]
+        content_raw = " ".join(texts)
+        
+        # Chuẩn hóa khoảng trắng và dấu câu
+        content_raw = re.sub(r"\s+", " ", content_raw).strip()
+        content_raw = re.sub(r"\s+([.,!?;:])", r"\1", content_raw)
+        
+        return {
+            "ordinal_number": ordinal,
+            "content_raw": content_raw,
         }
-    )
-    proxy_handler = urllib.request.ProxyHandler(build_proxy_config() or {})
-    handlers = [proxy_handler]
-
-    cookie_file = os.getenv("YOUTUBE_COOKIE_FILE")
-    if cookie_file and os.path.exists(cookie_file):
-        cookie_jar = MozillaCookieJar()
-        cookie_jar.load(cookie_file, ignore_discard=True, ignore_expires=True)
-        handlers.append(urllib.request.HTTPCookieProcessor(cookie_jar))
-
-    opener = urllib.request.build_opener(*handlers)
-    with opener.open(request, timeout=20) as response:
-        return response.read().decode("utf-8", errors="ignore")
-
-
-def extract_caption_tracks(video_id: str) -> List[Dict]:
-    watch_html = fetch_url(f"https://www.youtube.com/watch?v={video_id}")
-    match = re.search(r'"captionTracks":(\[.*?\])', watch_html)
-    if not match:
-        raise ValueError("No caption tracks found on watch page")
-    return json.loads(html.unescape(match.group(1)))
-
-
-def pick_caption_track(caption_tracks: List[Dict], langs: List[str]) -> Optional[Dict]:
-    def track_matches(track, lang):
-        track_lang = (track.get("languageCode") or "").lower()
-        return track_lang == lang or track_lang.startswith(f"{lang}-")
-
-    for lang in langs:
-        for track in caption_tracks:
-            if track_matches(track, lang) and track.get("kind") != "asr":
-                return track
-
-    for lang in langs:
-        for track in caption_tracks:
-            if track_matches(track, lang):
-                return track
-
-    return caption_tracks[0] if caption_tracks else None
-
-
-def parse_caption_xml(xml_text: str) -> List[Dict]:
-    root = ET.fromstring(xml_text)
-    items = []
-    for node in root.findall(".//text"):
-        text = "".join(node.itertext()).strip()
-        items.append({
-            "start": node.attrib.get("start", 0),
-            "duration": node.attrib.get("dur", 0),
-            "text": html.unescape(text)
-        })
-    return items
-
-
-def parse_caption_json(json_text: str) -> List[Dict]:
-    payload = json.loads(json_text)
-    items = []
-    for event in payload.get("events", []):
-        if "segs" not in event:
-            continue
-        text = "".join(seg.get("utf8", "") for seg in event["segs"]).strip()
-        items.append({
-            "start": event.get("tStartMs", 0) / 1000,
-            "duration": event.get("dDurationMs", 0) / 1000,
-            "text": html.unescape(text)
-        })
-    return items
-
-
-def fetch_transcript(video_id: str, lang: str = "vi") -> Dict:
-    """Fetch transcript từ YouTube"""
-    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-    from youtube_transcript_api.proxies import GenericProxyConfig
-
-    langs = [lang] + [item for item in DEFAULT_LANGS if item != lang]
-    errors = []
-
-    # Thử dùng youtube-transcript-api trước
-    try:
-        proxy_config = None
-        proxy_dict = build_proxy_config()
-        if proxy_dict:
-            proxy_config = GenericProxyConfig(
-                http_url=proxy_dict.get("http"),
-                https_url=proxy_dict.get("https")
-            )
-        
-        ytt_api = YouTubeTranscriptApi(
-            proxy_config=proxy_config,
-            http_client=build_http_client()
-        )
-        transcript_list = ytt_api.list(video_id)
-        
-        try:
-            transcript = transcript_list.find_transcript(langs)
-        except Exception:
-            transcript = transcript_list.find_generated_transcript(langs)
-        
-        data = transcript.fetch()
-        result = normalize_segments([
-            {"start": item.start, "duration": item.duration, "text": item.text}
-            for item in data
-        ], transcript.language_code, video_id)
-        return result
-    except TranscriptsDisabled:
-        errors.append("Transcripts are disabled for this video")
-    except NoTranscriptFound:
-        errors.append("No transcript found")
-    except Exception as e:
-        errors.append(f"youtube-transcript-api failed: {e}")
-
-    # Fallback: lấy từ caption track
-    try:
-        caption_tracks = extract_caption_tracks(video_id)
-        track = pick_caption_track(caption_tracks, langs)
-        if not track:
-            raise ValueError("No usable caption track found")
-
-        base_url = track["baseUrl"]
-        try:
-            parsed_url = urllib.parse.urlparse(base_url)
-            query = urllib.parse.parse_qs(parsed_url.query)
-            query["fmt"] = ["json3"]
-            json3_url = urllib.parse.urlunparse(
-                parsed_url._replace(query=urllib.parse.urlencode(query, doseq=True))
-            )
-            items = parse_caption_json(fetch_url(json3_url))
-        except Exception:
-            items = parse_caption_xml(fetch_url(base_url))
-
-        result = normalize_segments(items, track.get("languageCode", langs[0]), video_id)
-        return result
-    except Exception as e:
-        errors.append(f"Caption track fallback failed: {e}")
-
-    return {"error": "\n".join(errors)}
 
 
 # ============================================================================
-# SMART PARAGRAPH SPLITTING (CẢI TIẾN)
+# AI PROCESSOR (Qwen + Fallback OpenAI)
 # ============================================================================
 
-def is_sentence_ending(text: str) -> bool:
-    """Kiểm tra xem text có kết thúc bằng dấu câu hoàn chỉnh không"""
-    text = text.strip()
-    if not text:
-        return False
-    # Kết thúc bằng . ! ? ... : và có thể có dấu ngoặc đóng
-    return bool(re.search(r'[.!?…:]["\'\)]?\s*$', text))
 
+class AIProcessor:
+    """Xử lý AI để tạo quotes và captions với Qwen làm primary"""
 
-def find_safe_split_point(text: str, max_bytes: int) -> int:
-    """Tìm điểm cắt an toàn (không cắt ngang câu)"""
-    if len(text.encode('utf-8')) <= max_bytes:
-        return len(text)
-    
-    # Cắt ở max_bytes
-    candidate = text[:max_bytes]
-    
-    # Đảm bảo không cắt ngang ký tự UTF-8
-    while candidate and not candidate.encode('utf-8').decode('utf-8', errors='ignore'):
-        candidate = candidate[:-1]
-    
-    # Tìm dấu câu gần nhất để cắt
-    last_period = candidate.rfind('.')
-    last_exclaim = candidate.rfind('!')
-    last_question = candidate.rfind('?')
-    last_newline = candidate.rfind('\n')
-    
-    split_points = [p for p in [last_period, last_exclaim, last_question, last_newline] if p > 0]
-    
-    if split_points:
-        # Chọn điểm cắt xa nhất nhưng vẫn trong giới hạn
-        return max(split_points) + 1
-    
-    # Nếu không tìm thấy, cắt ở khoảng trắng cuối cùng
-    last_space = candidate.rfind(' ')
-    if last_space > max_bytes // 2:
-        return last_space
-    
-    return max_bytes
-
-
-def split_long_text(text: str, max_bytes: int) -> List[str]:
-    """Chia text dài thành nhiều đoạn nhỏ, đảm bảo không cắt ngang câu"""
-    if not text or len(text.encode('utf-8')) <= max_bytes:
-        return [text] if text else []
-    
-    paragraphs = []
-    remaining = text.strip()
-    
-    while remaining:
-        if len(remaining.encode('utf-8')) <= max_bytes:
-            paragraphs.append(remaining.strip())
-            break
+    def __init__(self):
+        self.qwen_key = DASHSCOPE_API_KEY
+        self.openai_key = OPENAI_API_KEY
         
-        split_idx = find_safe_split_point(remaining, max_bytes)
-        segment = remaining[:split_idx].strip()
+        if not self.qwen_key and not self.openai_key:
+            log("Cảnh báo: Không có API key nào (Qwen hoặc OpenAI)", "WARNING")
+
+    def create_quote_and_caption(self, paragraph: str, context_before: str = "", 
+                                  context_after: str = "", video_title: str = "",
+                                  video_description: str = "") -> Optional[Dict]:
+        """
+        Tạo quote và caption từ paragraph với ngữ cảnh
         
-        if segment:
-            paragraphs.append(segment)
+        Args:
+            paragraph: Đoạn văn cần trích xuất quote
+            context_before: Ngữ cảnh trước (1-2 paragraphs)
+            context_after: Ngữ cảnh sau (1 paragraph)
+            video_title: Tiêu đề video
+            video_description: Mô tả video
+            
+        Returns:
+            Dict với keys: quote, caption, score (0-10)
+            hoặc None nếu thất bại
+        """
+        prompt = self._build_prompt(paragraph, context_before, context_after, 
+                                    video_title, video_description)
         
-        remaining = remaining[split_idx:].lstrip()
+        # Thử Qwen trước
+        result = self._call_qwen(prompt)
+        if result:
+            return result
         
-        # Tránh vòng lặp vô tận
-        if split_idx == 0:
-            paragraphs.append(remaining[:max_bytes].strip())
-            remaining = remaining[max_bytes:].lstrip()
-    
-    return paragraphs
-
-
-def build_paragraphs(segments: List[Dict], config: Dict = None) -> List[str]:
-    """
-    Xây dựng các paragraph từ segments với logic thông minh:
-    - Giữ ngữ cảnh giữa các câu
-    - Không cắt ngang câu đang nói
-    - Tôn trọng khoảng nghỉ tự nhiên
-    """
-    config = config or PARAGRAPH_CONFIG
-    paragraphs = []
-    chunk_segments = []
-    
-    # Lọc và chuẩn hóa segments
-    normalized = []
-    for seg in segments:
-        text = seg.get("text", "").strip()
-        if not text:
-            continue
-        normalized.append({
-            "text": text,
-            "start": float(seg.get("start", 0)),
-            "duration": float(seg.get("duration", 0))
-        })
-    
-    if not normalized:
-        return []
-    
-    for i, segment in enumerate(normalized):
-        chunk_segments.append(segment)
-        next_segment = normalized[i + 1] if i + 1 < len(normalized) else None
+        # Fallback sang OpenAI
+        if self.openai_key:
+            log("Qwen thất bại, đang thử OpenAI...", "WARNING")
+            return self._call_openai(prompt)
         
-        # Kiểm tra xem có nên flush paragraph không
-        current_text = " ".join(s["text"] for s in chunk_segments)
-        current_bytes = len(current_text.encode('utf-8'))
+        log("Không có AI available, trả về default", "WARNING")
+        return self._create_default(paragraph)
+
+    def _build_prompt(self, paragraph: str, context_before: str, context_after: str,
+                      video_title: str, video_description: str) -> str:
+        """Xây dựng prompt chi tiết cho AI"""
         
-        should_flush = False
-        
-        # Vượt quá max_bytes → buộc phải flush
-        if current_bytes >= config["max_bytes"]:
-            should_flush = True
-        
-        # Đạt target_bytes và có điều kiện thuận lợi
-        elif current_bytes >= config["target_bytes"]:
-            # Có đủ segments
-            if len(chunk_segments) >= config["max_segments"]:
-                should_flush = True
-            # Kết thúc tự nhiên (dấu câu)
-            elif is_sentence_ending(current_text):
-                should_flush = True
-            # Có khoảng nghỉ lớn
-            elif next_segment and has_time_gap(segment, next_segment, config["break_gap_seconds"]):
-                should_flush = True
-        
-        if should_flush and current_bytes >= config["min_bytes"]:
-            # Extract và thêm vào paragraphs
-            text = " ".join(s["text"] for s in chunk_segments).strip()
-            if len(text.encode('utf-8')) > config["max_bytes"]:
-                # Chia nhỏ nếu quá dài
-                sub_paragraphs = split_long_text(text, config["max_bytes"])
-                paragraphs.extend(sub_paragraphs)
-            else:
-                paragraphs.append(text)
-            chunk_segments = []
-    
-    # Xử lý phần còn lại
-    if chunk_segments:
-        text = " ".join(s["text"] for s in chunk_segments).strip()
-        if text:
-            if len(text.encode('utf-8')) > config["max_bytes"]:
-                sub_paragraphs = split_long_text(text, config["max_bytes"])
-                paragraphs.extend(sub_paragraphs)
-            else:
-                paragraphs.append(text)
-    
-    return paragraphs
+        prompt = f"""Bạn là một chuyên gia về sách và content creator, nhiệm vụ của bạn là trích xuất những câu nói hay (quotes) từ đoạn văn dưới đây và viết một bài đăng chia sẻ cảm xúc tự nhiên như một người đọc sách.
 
+## THÔNG TIN VIDEO
+**Tiêu đề:** {video_title if video_title else "Không có"}
+**Mô tả:** {video_description[:500] if video_description else "Không có"}
 
-def has_time_gap(current_seg: Dict, next_seg: Dict, gap_seconds: float) -> bool:
-    """Kiểm tra xem có khoảng nghỉ thời gian giữa 2 segments không"""
-    if not next_seg:
-        return True
-    current_end = current_seg["start"] + current_seg["duration"]
-    next_start = next_seg["start"]
-    return (next_start - current_end) >= gap_seconds
+## NGỮ CẢNH
+**Đoạn trước:** {context_before[:500] if context_before else "Không có"}
 
+**Đoạn hiện tại:** {paragraph}
 
-# ============================================================================
-# AI QUOTE GENERATION (CẢI TIẾN ĐÁNG KỂ)
-# ============================================================================
+**Đoạn sau:** {context_after[:500] if context_after else "Không có"}
 
-def build_enhanced_prompt(transcript_chunk: str, video_title: str = "", book_name: str = "") -> str:
-    """
-    Xây dựng prompt cải tiến với đầy đủ ngữ cảnh
-    """
-    # Lấy ngữ cảnh xung quanh (nếu có)
-    context_hint = ""
-    if video_title:
-        context_hint += f"- Video này có tiêu đề: \"{video_title}\"\n"
-    if book_name:
-        context_hint += f"- Nội dung liên quan đến sách: \"{book_name}\"\n"
-    
-    return f"""Bạn là một người yêu sách và muốn chia sẻ những trích dẫn hay từ video đọc sách trên YouTube.
+## YÊU CẦU
 
-THÔNG TIN NGỮ CẢNH:
-{context_hint if context_hint else "- Không có thông tin bổ sung"}
+### 1. TRÍCH XUẤT QUOTE
+Chọn MỘT câu hoặc đoạn ngắn (tối đa 3 dòng) hay nhất, sâu sắc nhất từ đoạn hiện tại. Quote phải:
+- Có ý nghĩa độc lập, dễ hiểu
+- Truyền cảm hứng hoặc gợi suy ngẫm
+- Đúng nguyên văn từ transcript
 
-ĐOẠN TRANSCRIPT CẦN XỬ LÝ:
-\"\"\"
-{transcript_chunk}
-\"\"\"
+### 2. VIẾT CAPTION
+Viết một bài đăng Facebook/Instagram (200-400 từ) chia sẻ về quote này với giọng văn:
+- **Tự nhiên, chân thật** như một người đọc sách thực sự
+- **Có cảm xúc**: Thể hiện sự đồng cảm, suy ngẫm cá nhân
+- **Có ngữ cảnh**: Giải thích ngắn gọn bối cảnh của quote trong câu chuyện
+- **Thu hút**: Mở đầu ấn tượng, kết thúc gợi mở
+- **Không sáo rỗng**: Tránh những câu chung chung như "rất hay", "ý nghĩa"
 
-NHIỆM VỤ:
-Từ đoạn transcript trên, hãy tạo MỘT bài đăng ngắn gọn, tự nhiên và cảm xúc để chia sẻ trên mạng xã hội.
+### 3. ĐÁNH GIÁ CHẤT LƯỢNG (Score 0-10)
+Chấm điểm dựa trên:
+- Quote có hay và ý nghĩa không?
+- Caption có tự nhiên, chân thật không?
+- Có đủ ngữ cảnh để hiểu không?
 
-YÊU CẦU CHI TIẾT:
+## ĐỊNH DẠNG OUTPUT (JSON)
+{{
+    "quote": "trích dẫn nguyên văn quote",
+    "caption": "nội dung caption đầy đủ",
+    "score": 8.5,
+    "reasoning": "lý do chấm điểm này"
+}}
 
-1. PHONG CÁCH VIẾT:
-   - Viết như một người thật vừa đọc xong và muốn chia sẻ cảm xúc
-   - Tự nhiên, chân thành, không máy móc hay công thức
-   - Có thể bắt đầu bằng cảm nhận cá nhân: "Đọc tới đây mình thấy...", "Điều này làm mình suy nghĩ...", "Thật sự ấn tượng với..."
+Hãy phân tích kỹ và đưa ra kết quả chất lượng cao nhất."""
 
-2. CẤU TRÚ BÀI ĐĂNG (ưu tiên theo thứ tự):
-   
-   Option A (Tốt nhất - Nếu có câu trích hay):
-   - 1 câu cảm nhận ngắn (10-20 từ)
-   - 1 câu trích NGUYÊN VĂN từ transcript (15-40 từ) đặt trong ngoặc kép
-   - Ví dụ: "Đọc tới đây mình thấm thía rằng đôi khi điều ta cần nhất chỉ là được thấu hiểu: \"Ai cũng khao khát được lắng nghe và trân trọng.\""
-   
-   Option B (Nếu không có câu trích đủ hay):
-   - 1-2 câu cảm nhận rõ ràng, có ý nghĩa
-   - KHÔNG cố chèn ngoặc kép nếu không có gì đáng trích
-   - Ví dụ: "Thông điệp này nhắc nhở mình rằng trong cuộc sống vội vã, đôi khi ta quên mất việc dừng lại để lắng nghe chính mình."
+        return prompt
 
-3. TIÊU CHÍ CHỌN CÂU TRÍCH (cho Option A):
-   - Phải là câu HOÀN CHỈNH, đủ chủ ngữ vị ngữ
-   - Có ý nghĩa độc lập, không cần nhiều ngữ cảnh vẫn hiểu
-   - Gợi cảm xúc hoặc suy ngẫm
-   - Độ dài: 15-40 từ (ưu tiên 20-30 từ)
-   - KHÔNG chọn: câu quá ngắn (<8 từ), câu cụt, câu cần ngữ cảnh mới hiểu, câu chung chung nhạt nhẽo
-
-4. NHỮNG ĐIỀU CẦN TRÁNH:
-   - ❌ Không bịa đặt câu trích không có trong transcript
-   - ❌ Không thêm tên sách nếu không chắc chắn
-   - ❌ Không viết quá 2 câu tổng cộng
-   - ❌ Không giải thích dài dòng, không meta-comment ("Đây là câu nói hay...")
-   - ❌ Không dùng ngôn ngữ quá trang trọng hay học thuật
-   - ❌ Không cắt ngang câu đang nói để làm quote
-
-5. ĐỊNH DẠNG ĐẦU RA:
-   - Chỉ trả về NỘI DUNG bài đăng cuối cùng
-   - KHÔNG thêm giải thích, KHÔNG thêm markdown, KHÔNG thêm "Output:" hay prefix nào
-   - Nếu có câu trích, đặt trong ngoặc kép "..."
-
-VÍ DỤ ĐẦU RA TỐT:
-- "Đọc đoạn này mình nhận ra hạnh phúc đôi khi đơn giản lắm: \"Hạnh phúc không phải là có tất cả, mà là biết trân trọng những gì đang có.\""
-- "Câu này làm mình suy nghĩ nhiều về cách ta đối xử với nhau: \"Lời nói có thể làm tổn thương, nhưng cũng có thể chữa lành.\""
-- "Thông điệp này nhắc nhở mình sống chậm lại một chút: \"Cuộc đời không chờ đợi ai, nhưng cũng không bao giờ là quá muộn để bắt đầu.\""
-- "Thật sự ấn tượng với cách tác giả diễn đạt: \"Chúng ta thường sợ thất bại, nhưng thực ra sợ nhất là không bao giờ thử.\""
-
-Bây giờ, hãy viết bài đăng dựa trên đoạn transcript đã cho:"""
-
-
-def generate_with_gemini(text: str, video_title: str = "") -> Optional[str]:
-    """Sinh quote/caption bằng Gemini API"""
-    api_key = GEMINI_API_KEYS[0] if GEMINI_API_KEYS else None
-    if not api_key:
-        print("⚠️ Thiếu Gemini API key")
-        return None
-    
-    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key={api_key}"
-    
-    prompt = build_enhanced_prompt(text, video_title)
-    
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
-    
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data.get("candidates"):
-            print(f"⚠️ Gemini không trả về candidates: {data}")
+    def _call_qwen(self, prompt: str) -> Optional[Dict]:
+        """Gọi Qwen API qua DashScope"""
+        if not self.qwen_key:
             return None
         
-        result = data["candidates"][0]["content"]["parts"][0]["text"]
-        return result.strip()
-    
-    except requests.exceptions.RequestException as e:
-        print(f"⚠️ Gemini API lỗi: {e}")
-        return None
-    except (KeyError, IndexError) as e:
-        print(f"⚠️ Lỗi parse response Gemini: {e}")
-        return None
+        try:
+            log("Đang gọi Qwen API...")
+            
+            headers = {
+                "Authorization": f"Bearer {self.qwen_key}",
+                "Content-Type": "application/json",
+            }
+            
+            payload = {
+                "model": "qwen-plus",
+                "input": {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Bạn là một chuyên gia về sách và content creator. Hãy trả lời bằng JSON."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ]
+                },
+                "parameters": {
+                    "temperature": 0.7,
+                    "max_tokens": 1000,
+                    "result_format": "message"
+                }
+            }
+            
+            response = requests.post(
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if result.get("status_code") == 200:
+                content = result["output"]["choices"][0]["message"]["content"]
+                return self._parse_ai_response(content)
+            else:
+                log(f"Qwen API error: {result}", "ERROR")
+                return None
+                
+        except requests.RequestException as e:
+            log(f"Lỗi gọi Qwen API: {e}", "ERROR")
+            return None
+        except Exception as e:
+            log(f"Lỗi xử lý Qwen response: {e}", "ERROR")
+            return None
 
-
-def generate_with_openai(text: str, video_title: str = "") -> Optional[str]:
-    """Sinh quote/caption bằng OpenAI API (fallback)"""
-    if not OPENAI_API_KEY:
-        return None
-    
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = build_enhanced_prompt(text, video_title)
+    def _call_openai(self, prompt: str) -> Optional[Dict]:
+        """Gọi OpenAI API (fallback)"""
+        if not self.openai_key:
+            return None
         
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=200
+        try:
+            log("Đang gọi OpenAI API...")
+            
+            client = OpenAI(api_key=self.openai_key)
+            
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Bạn là một chuyên gia về sách và content creator. Hãy trả lời bằng JSON."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=1000,
+                response_format={"type": "json_object"}
+            )
+            
+            content = response.choices[0].message.content
+            return self._parse_ai_response(content)
+            
+        except Exception as e:
+            log(f"Lỗi gọi OpenAI API: {e}", "ERROR")
+            return None
+
+    def _parse_ai_response(self, content: str) -> Optional[Dict]:
+        """Parse JSON response từ AI"""
+        try:
+            # Tìm JSON trong response
+            json_match = re.search(r"\{[^{}]*\}", content, re.DOTALL)
+            if json_match:
+                content = json_match.group()
+            
+            data = json.loads(content)
+            
+            # Validate required fields
+            if "quote" not in data or "caption" not in data:
+                log("AI response thiếu quote hoặc caption", "WARNING")
+                return None
+            
+            # Default score nếu không có
+            if "score" not in data:
+                data["score"] = 7.0
+            if "reasoning" not in data:
+                data["reasoning"] = ""
+            
+            # Làm sạch
+            data["quote"] = clean_text(str(data["quote"]))
+            data["caption"] = clean_text(str(data["caption"]))
+            
+            log(f"AI tạo quote thành công, score: {data['score']}")
+            return data
+            
+        except json.JSONDecodeError as e:
+            log(f"Lỗi parse JSON từ AI: {e}", "ERROR")
+            return None
+
+    def _create_default(self, paragraph: str) -> Dict:
+        """Tạo quote/caption default khi không có AI"""
+        # Lấy câu đầu tiên làm quote
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph)
+        quote = sentences[0] if sentences else paragraph[:200]
+        
+        caption = f"Một đoạn trích hay:\n\n\"{quote}\"\n\nTừ nội dung trên, chúng ta có thể suy ngẫm về nhiều điều thú vị."
+        
+        return {
+            "quote": quote,
+            "caption": caption,
+            "score": 5.0,
+            "reasoning": "Default fallback"
+        }
+
+
+# ============================================================================
+# DATABASE OPERATIONS
+# ============================================================================
+
+
+class DatabaseManager:
+    """Quản lý thao tác database"""
+
+    def __init__(self, connection):
+        self.conn = connection
+
+    def video_exists(self, video_id: str) -> Optional[int]:
+        """Kiểm tra video đã tồn tại trong DB chưa, trả về id"""
+        try:
+            cursor = self.conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT id FROM youtube_videos WHERE video_id = %s",
+                (video_id,)
+            )
+            result = cursor.fetchone()
+            cursor.close()
+            return result["id"] if result else None
+        except Error as e:
+            log(f"Lỗi kiểm tra video: {e}", "ERROR")
+            return None
+
+    def has_transcript(self, video_db_id: int) -> bool:
+        """Kiểm tra video đã có transcript chưa"""
+        try:
+            cursor = self.conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM youtube_paragraphs WHERE youtube_video_id = %s",
+                (video_db_id,)
+            )
+            result = cursor.fetchone()
+            cursor.close()
+            return result["count"] > 0
+        except Error as e:
+            log(f"Lỗi kiểm tra transcript: {e}", "ERROR")
+            return False
+
+    def save_paragraphs(self, video_db_id: int, paragraphs: List[Dict]):
+        """Lưu paragraphs vào database"""
+        try:
+            cursor = self.conn.cursor()
+            
+            for para in paragraphs:
+                cursor.execute(
+                    """INSERT INTO youtube_paragraphs 
+                       (ordinal_number, content_raw, content, youtube_video_id, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, NOW(6), NOW(6))""",
+                    (
+                        para["ordinal_number"],
+                        para["content_raw"],
+                        para.get("content", para["content_raw"]),
+                        video_db_id,
+                    )
+                )
+            
+            self.conn.commit()
+            cursor.close()
+            log(f"Đã lưu {len(paragraphs)} paragraphs")
+            
+        except Error as e:
+            log(f"Lỗi lưu paragraphs: {e}", "ERROR")
+            self.conn.rollback()
+
+    def save_quotes(self, video_db_id: int, quotes: List[Dict]):
+        """Lưu quotes vào database"""
+        try:
+            cursor = self.conn.cursor()
+            
+            for quote_data in quotes:
+                cursor.execute(
+                    """INSERT INTO youtube_quotes 
+                       (ordinal_number, content, is_visible, youtube_video_id, created_at, updated_at)
+                       VALUES (%s, %s, %s, %s, NOW(6), NOW(6))""",
+                    (
+                        quote_data["ordinal_number"],
+                        quote_data["content"],
+                        quote_data.get("is_visible", 1),
+                        video_db_id,
+                    )
+                )
+            
+            self.conn.commit()
+            cursor.close()
+            log(f"Đã lưu {len(quotes)} quotes")
+            
+        except Error as e:
+            log(f"Lỗi lưu quotes: {e}", "ERROR")
+            self.conn.rollback()
+
+    def get_all_video_ids(self) -> List[Tuple[int, str]]:
+        """Lấy tất cả video IDs từ database"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id, video_id FROM youtube_videos ORDER BY created_at DESC")
+            results = cursor.fetchall()
+            cursor.close()
+            return [(row[0], row[1]) for row in results]
+        except Error as e:
+            log(f"Lỗi lấy video IDs: {e}", "ERROR")
+            return []
+
+    def get_video_info(self, video_db_id: int) -> Dict:
+        """Lấy thông tin video"""
+        try:
+            cursor = self.conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT * FROM youtube_videos WHERE id = %s",
+                (video_db_id,)
+            )
+            result = cursor.fetchone()
+            cursor.close()
+            return result or {}
+        except Error as e:
+            log(f"Lỗi lấy thông tin video: {e}", "ERROR")
+            return {}
+
+    def get_paragraphs_for_video(self, video_db_id: int) -> List[Dict]:
+        """Lấy tất cả paragraphs của video"""
+        try:
+            cursor = self.conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT * FROM youtube_paragraphs WHERE youtube_video_id = %s ORDER BY ordinal_number",
+                (video_db_id,)
+            )
+            results = cursor.fetchall()
+            cursor.close()
+            return results
+        except Error as e:
+            log(f"Lỗi lấy paragraphs: {e}", "ERROR")
+            return []
+
+
+# ============================================================================
+# MAIN PROCESSOR
+# ============================================================================
+
+
+class YouTubeProcessor:
+    """Class chính để xử lý toàn bộ quy trình"""
+
+    def __init__(self):
+        self.conn = get_db_connection()
+        if not self.conn:
+            raise Exception("Không thể kết nối database")
+        
+        self.db = DatabaseManager(self.conn)
+        self.transcript_fetcher = YouTubeTranscriptFetcher(
+            cookie_file=os.getenv("YOUTUBE_COOKIE_FILE")
         )
+        self.paragraph_splitter = ParagraphSplitter()
+        self.ai_processor = AIProcessor()
+
+    def process_video(self, video_id: str) -> bool:
+        """
+        Xử lý một video hoàn chỉnh
         
-        result = response.choices[0].message.content
-        return result.strip() if result else None
-    
-    except Exception as e:
-        print(f"⚠️ OpenAI API lỗi: {e}")
-        return None
+        Returns:
+            True nếu thành công, False nếu thất bại
+        """
+        log(f"{'='*60}")
+        log(f"Bắt đầu xử lý video: {video_id}")
+        log(f"{'='*60}")
 
+        try:
+            # Bước 1: Kiểm tra video tồn tại trong DB
+            video_db_id = self.db.video_exists(video_id)
+            if not video_db_id:
+                log(f"Video {video_id} không tồn tại trong database", "ERROR")
+                return False
 
-def normalize_and_validate_quote(ai_output: str, original_text: str) -> Optional[str]:
-    """
-    Chuẩn hóa và validate quote từ AI:
-    - Làm sạch
-    - Kiểm tra độ dài
-    - Đảm bảo có ý nghĩa
-    """
-    if not ai_output:
-        return None
-    
-    # Làm sạch
-    result = ai_output.strip()
-    
-    # Loại bỏ các prefix không mong muốn
-    prefixes_to_remove = [
-        "Output:", "Kết quả:", "Bài đăng:", "Caption:", 
-        "Đây là:", "Result:", "Here's:"
-    ]
-    for prefix in prefixes_to_remove:
-        if result.lower().startswith(prefix.lower()):
-            result = result[len(prefix):].strip()
-    
-    # Loại bỏ markdown quotes
-    if result.startswith("> "):
-        result = result[2:]
-    
-    # Loại bỏ dấu ngoặc kép thừa ở đầu/cuối nếu toàn bộ là quote
-    if result.startswith('"') and result.endswith('"') and result.count('"') == 2:
-        # Đây có thể là trường hợp AI chỉ trả về câu trích, thêm cảm nhận
-        # Nhưng ta giữ nguyên vì có thể user muốn vậy
-        pass
-    
-    # Kiểm tra độ dài tối thiểu
-    if len(result) < 30:
-        print(f"⚠️ Quote quá ngắn ({len(result)} chars): {result[:50]}...")
-        return None
-    
-    # Kiểm tra độ dài tối đa (khoảng 2 câu)
-    sentences = re.split(r'[.!?…]+', result)
-    sentences = [s.strip() for s in sentences if s.strip()]
-    if len(sentences) > 3:
-        print(f"⚠️ Quote quá dài ({len(sentences)} câu)")
-        # Cắt lấy 2 câu đầu
-        result = ". ".join(sentences[:2]) + "."
-    
-    # Nếu có ngoặc kép, kiểm tra câu trích bên trong
-    quoted_texts = re.findall(r'"([^"]+)"', result)
-    if quoted_texts:
-        longest_quote = max(quoted_texts, key=len).strip()
-        words = longest_quote.split()
+            # Bước 2: Kiểm tra đã có transcript chưa
+            if self.db.has_transcript(video_db_id):
+                log(f"Video {video_id} đã có transcript, bỏ qua", "WARNING")
+                return True
+
+            # Bước 3: Lấy thông tin video
+            video_info = self.db.get_video_info(video_db_id)
+            video_title = video_info.get("title", "")
+            video_description = video_info.get("description", "")
+
+            # Bước 4: Lấy transcript
+            segments = self.transcript_fetcher.fetch_transcript(video_id)
+            
+            if not segments:
+                # Thử fallback qua API
+                log("Thử fallback qua youtube-transcript-api...")
+                segments = self.transcript_fetcher.fetch_from_api(video_id)
+            
+            if not segments:
+                log(f"Không lấy được transcript cho video {video_id}", "ERROR")
+                return False
+
+            # Bước 5: Chia paragraphs
+            paragraphs = self.paragraph_splitter.split(segments)
+            
+            if not paragraphs:
+                log("Không chia được paragraphs", "ERROR")
+                return False
+
+            # Bước 6: Lưu paragraphs
+            self.db.save_paragraphs(video_db_id, paragraphs)
+
+            # Bước 7: Tạo quotes và captions với AI
+            all_quotes = []
+            all_paragraphs_data = self.db.get_paragraphs_for_video(video_db_id)
+            
+            for i, para_record in enumerate(all_paragraphs_data):
+                para_text = para_record["content_raw"]
+                
+                # Lấy ngữ cảnh
+                context_before = ""
+                context_after = ""
+                
+                if i > 0:
+                    context_before = all_paragraphs_data[i-1]["content_raw"]
+                if i < len(all_paragraphs_data) - 1:
+                    context_after = all_paragraphs_data[i+1]["content_raw"]
+                
+                # Gọi AI
+                log(f"Đang xử lý paragraph {i+1}/{len(all_paragraphs_data)}...")
+                ai_result = self.ai_processor.create_quote_and_caption(
+                    paragraph=para_text,
+                    context_before=context_before,
+                    context_after=context_after,
+                    video_title=video_title,
+                    video_description=video_description
+                )
+                
+                if ai_result:
+                    # Chỉ lưu quotes có score >= 6
+                    is_visible = 1 if ai_result["score"] >= 6 else 0
+                    
+                    quote_record = {
+                        "ordinal_number": i + 1,
+                        "content": json.dumps({
+                            "quote": ai_result["quote"],
+                            "caption": ai_result["caption"],
+                            "score": ai_result["score"],
+                            "reasoning": ai_result["reasoning"]
+                        }, ensure_ascii=False),
+                        "is_visible": is_visible,
+                    }
+                    all_quotes.append(quote_record)
+                    
+                    log(f"Quote {i+1}: score={ai_result['score']}, visible={is_visible}")
+
+            # Bước 8: Lưu quotes
+            if all_quotes:
+                self.db.save_quotes(video_db_id, all_quotes)
+                visible_count = sum(1 for q in all_quotes if q["is_visible"])
+                log(f"Tổng cộng: {len(all_quotes)} quotes, {visible_count} quotes hiển thị")
+
+            log(f"Xử lý thành công video {video_id}!")
+            return True
+
+        except Exception as e:
+            log(f"Lỗi không xác định khi xử lý video {video_id}: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def process_batch(self, video_ids: List[str]) -> Dict[str, bool]:
+        """Xử lý hàng loạt videos"""
+        results = {}
         
-        # Quote quá ngắn
-        if len(words) < 8:
-            print(f"⚠️ Câu trích quá ngắn ({len(words)} từ): {longest_quote}")
-            # Vẫn giữ kết quả nhưng log warning
-        # Quote quá dài
-        elif len(words) > 50:
-            print(f"⚠️ Câu trích quá dài ({len(words)} từ)")
-    
-    return result if result else None
-
-
-def evaluate_quote_quality(quote: str, original_text: str) -> float:
-    """
-    Đánh giá chất lượng quote (0-10)
-    Trả về score để lọc quote kém chất lượng
-    """
-    score = 5.0  # Điểm cơ bản
-    
-    # Có câu trích trong ngoặc kép
-    if '"' in quote:
-        quoted = re.findall(r'"([^"]+)"', quote)
-        if quoted:
-            longest = max(quoted, key=len)
-            words = longest.split()
+        for i, video_id in enumerate(video_ids, 1):
+            log(f"\n{'='*60}")
+            log(f"Processing {i}/{len(video_ids)}: {video_id}")
+            log(f"{'='*60}")
             
-            # Độ dài câu trích lý tưởng
-            if 15 <= len(words) <= 35:
-                score += 2
-            elif 8 <= len(words) < 15 or 35 < len(words) <= 50:
-                score += 1
+            success = self.process_video(video_id)
+            results[video_id] = success
             
-            # Câu trích có vẻ hoàn chỉnh
-            if re.search(r'[.!?]$', longest):
-                score += 1
-    
-    # Có cảm nhận cá nhân
-    personal_phrases = ["mình thấy", "mình nhận ra", "làm mình", "ấn tượng", "thấm thía", "nhớ lại"]
-    if any(p in quote.lower() for p in personal_phrases):
-        score += 1.5
-    
-    # Độ dài phù hợp
-    total_len = len(quote)
-    if 50 <= total_len <= 300:
-        score += 1
-    elif total_len < 50:
-        score -= 2
-    elif total_len > 400:
-        score -= 1
-    
-    # Không có từ ngữ tiêu cực mạnh
-    negative_words = ["chán", "tệ", "dở", "vô dụng", "ngu ngốc"]
-    if any(w in quote.lower() for w in negative_words):
-        score -= 1
-    
-    return max(0, min(10, score))
+            # Pause nhẹ giữa các videos
+            if i < len(video_ids):
+                import time
+                time.sleep(2)
+        
+        return results
+
+    def close(self):
+        """Đóng kết nối database"""
+        if self.conn and self.conn.is_connected():
+            self.conn.close()
+            log("Đã đóng kết nối database")
 
 
 # ============================================================================
-# MAIN PROCESSING
+# CLI ENTRY POINT
 # ============================================================================
-
-def process_video(conn, video: Dict, verbose: bool = True) -> bool:
-    """
-    Xử lý một video:
-    1. Lấy transcript
-    2. Chia paragraphs
-    3. Tạo quotes với AI
-    4. Lưu vào DB
-    """
-    video_id = video["video_id"]
-    video_db_id = video["id"]
-    video_title = video.get("title", "")
-    
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"🎬 Xử lý video: {video_id}")
-        if video_title:
-            print(f"   Tiêu đề: {video_title}")
-    
-    # Bước 1: Fetch transcript
-    if verbose:
-        print("📥 Đang lấy transcript...")
-    
-    transcript_data = fetch_transcript(video_id, lang="vi")
-    
-    if "error" in transcript_data:
-        print(f"❌ Lỗi lấy transcript: {transcript_data['error']}")
-        return False
-    
-    segments = transcript_data.get("segments", [])
-    if not segments:
-        print("❌ Không có segments nào")
-        return False
-    
-    if verbose:
-        print(f"✅ Lấy được {len(segments)} segments")
-    
-    # Bước 2: Build paragraphs
-    if verbose:
-        print("📝 Đang chia paragraphs...")
-    
-    # Xóa paragraphs cũ
-    delete_existing_paragraphs(conn, video_db_id)
-    
-    paragraphs = build_paragraphs(segments)
-    
-    if not paragraphs:
-        print("❌ Không tạo được paragraphs")
-        return False
-    
-    # Lưu paragraphs
-    for i, para in enumerate(paragraphs, 1):
-        save_paragraph(conn, video_db_id, i, para, para)
-    
-    if verbose:
-        print(f"✅ Đã lưu {len(paragraphs)} paragraphs")
-    
-    # Bước 3: Generate quotes với AI
-    if verbose:
-        print("🤖 Đang tạo quotes với AI...")
-    
-    # Xóa quotes cũ
-    delete_existing_quotes(conn, video_db_id)
-    
-    # Chia segments thành nhóm nhỏ để tạo quotes
-    # Mỗi nhóm ~5 segments để có đủ ngữ cảnh
-    groups = [segments[i:i+5] for i in range(0, len(segments), 5)]
-    
-    quotes_created = 0
-    quotes_skipped = 0
-    
-    for i, group in enumerate(groups):
-        raw_text = " ".join(s["text"] for s in group)
-        
-        # Skip nếu quá ngắn
-        if len(raw_text.encode('utf-8')) < 200:
-            quotes_skipped += 1
-            continue
-        
-        # Thử Gemini trước
-        ai_output = generate_with_gemini(raw_text, video_title)
-        
-        # Fallback sang OpenAI nếu cần
-        if not ai_output and OPENAI_API_KEY:
-            if verbose:
-                print(f"   ⚡ Fallback sang OpenAI cho group {i+1}...")
-            ai_output = generate_with_openai(raw_text, video_title)
-        
-        if not ai_output:
-            quotes_skipped += 1
-            continue
-        
-        # Chuẩn hóa và validate
-        normalized = normalize_and_validate_quote(ai_output, raw_text)
-        
-        if not normalized:
-            quotes_skipped += 1
-            continue
-        
-        # Đánh giá chất lượng
-        quality_score = evaluate_quote_quality(normalized, raw_text)
-        is_visible = quality_score >= 6.0
-        
-        if verbose:
-            visibility = "✅" if is_visible else "⚠️"
-            print(f"   {visibility} Group {i+1}: score={quality_score:.1f}")
-            if not is_visible and verbose:
-                print(f"      Content: {normalized[:100]}...")
-        
-        # Lưu quote
-        save_quote(conn, video_db_id, i + 1, normalized, is_visible)
-        quotes_created += 1
-    
-    if verbose:
-        print(f"✅ Đã tạo {quotes_created} quotes ({quotes_skipped} skipped)")
-    
-    return True
 
 
 def main():
-    """Hàm main"""
-    print("="*60)
-    print("🎬 YOUTUBE TRANSCRIPT PROCESSOR")
-    print("="*60)
+    """Hàm main cho CLI"""
+    import argparse
     
-    # Kết nối MySQL
-    conn = get_mysql_connection()
-    if not conn:
-        print("❌ Không thể kết nối MySQL. Kiểm tra cấu hình.")
+    parser = argparse.ArgumentParser(
+        description="YouTube Transcript Processor - Lấy transcript, chia đoạn, tạo quotes bằng AI"
+    )
+    
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("video_id", nargs="?", help="YouTube Video ID để xử lý")
+    group.add_argument("--file", "-f", help="File chứa danh sách video IDs (mỗi ID một dòng)")
+    group.add_argument("--all", "-a", action="store_true", help="Xử lý tất cả videos chưa có transcript")
+    
+    args = parser.parse_args()
+    
+    # Xác định danh sách videos cần xử lý
+    video_ids = []
+    
+    if args.video_id:
+        video_ids = [args.video_id]
+    elif args.file:
+        if not os.path.exists(args.file):
+            log(f"File {args.file} không tồn tại", "ERROR")
+            sys.exit(1)
+        
+        with open(args.file, "r") as f:
+            video_ids = [line.strip() for line in f if line.strip()]
+        
+        log(f"Đã đọc {len(video_ids)} video IDs từ {args.file}")
+    elif args.all:
+        processor = YouTubeProcessor()
+        all_videos = processor.db.get_all_video_ids()
+        video_ids = [vid for db_id, vid in all_videos]
+        processor.close()
+        log(f"Tìm thấy {len(video_ids)} videos trong database")
+    
+    if not video_ids:
+        log("Không có video nào để xử lý", "ERROR")
         sys.exit(1)
     
-    print("✅ Kết nối MySQL thành công")
+    # Xử lý
+    processor = YouTubeProcessor()
     
-    # Kiểm tra mode chạy
-    if len(sys.argv) > 1:
-        # Chế độ xử lý video cụ thể từ file ids.txt hoặc video_id truyền vào
-        arg = sys.argv[1]
+    try:
+        results = processor.process_batch(video_ids)
         
-        if arg == "--file" and len(sys.argv) > 2:
-            # Đọc từ file
-            ids_file = sys.argv[2]
-            if not os.path.exists(ids_file):
-                print(f"❌ File không tồn tại: {ids_file}")
-                sys.exit(1)
-            
-            with open(ids_file, 'r') as f:
-                video_ids = [line.strip() for line in f if line.strip()]
-            
-            print(f"📄 Đọc được {len(video_ids)} video IDs từ {ids_file}")
-            
-            # Fetch info từ DB hoặc tạo mới
-            videos_to_process = []
-            for vid in video_ids:
-                video = fetch_video_by_id(conn, vid)
-                if video:
-                    videos_to_process.append(video)
-                else:
-                    print(f"⚠️ Video {vid} không có trong DB, bỏ qua")
-            
-            if not videos_to_process:
-                print("❌ Không có video nào để xử lý")
-                sys.exit(1)
+        # Báo cáo kết quả
+        success_count = sum(1 for v in results.values() if v)
+        total_count = len(results)
         
-        elif arg == "--all":
-            # Xử lý tất cả video chưa có quotes
-            limit = int(sys.argv[3]) if len(sys.argv) > 3 else 100
-            videos_to_process = fetch_videos_without_quotes(conn, limit)
-            print(f"📊 Tìm được {len(videos_to_process)} video chưa có quotes")
+        log(f"\n{'='*60}")
+        log(f"HOÀN THÀNH: {success_count}/{total_count} videos thành công")
+        log(f"{'='*60}")
         
-        else:
-            # Xử lý video_id cụ thể
-            video_id = arg
-            video = fetch_video_by_id(conn, video_id)
-            if not video:
-                print(f"❌ Video {video_id} không có trong DB")
-                sys.exit(1)
-            videos_to_process = [video]
-    else:
-        # Mặc định: xử lý video chưa có quotes
-        videos_to_process = fetch_videos_without_quotes(conn, 50)
-        print(f"📊 Tìm được {len(videos_to_process)} video chưa có quotes")
-    
-    if not videos_to_process:
-        print("✅ Không có video nào cần xử lý")
-        conn.close()
-        sys.exit(0)
-    
-    # Xử lý từng video
-    success_count = 0
-    error_count = 0
-    
-    for video in videos_to_process:
-        try:
-            if process_video(conn, video):
-                success_count += 1
-            else:
-                error_count += 1
-        except Exception as e:
-            print(f"❌ Lỗi xử lý video {video['video_id']}: {e}")
-            error_count += 1
-    
-    # Tổng kết
-    print("\n" + "="*60)
-    print("📊 KẾT QUẢ:")
-    print(f"   ✅ Thành công: {success_count}")
-    print(f"   ❌ Thất bại: {error_count}")
-    print("="*60)
-    
-    conn.close()
-    sys.exit(0 if error_count == 0 else 1)
+        if success_count < total_count:
+            failed = [vid for vid, ok in results.items() if not ok]
+            log(f"Failed: {', '.join(failed)}", "WARNING")
+        
+        sys.exit(0 if success_count == total_count else 1)
+        
+    finally:
+        processor.close()
 
 
 if __name__ == "__main__":
