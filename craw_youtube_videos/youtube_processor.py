@@ -34,6 +34,10 @@ from datetime import datetime
 import mysql.connector
 from mysql.connector import Error
 import requests
+from dotenv import load_dotenv
+
+# Load biến môi trường từ file .env
+load_dotenv()
 
 # ============================================================================
 # CẤU HÌNH
