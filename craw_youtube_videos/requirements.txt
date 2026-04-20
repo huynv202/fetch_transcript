@@ -1,0 +1,8 @@
+mysql-connector-python>=8.0.0
+requests>=2.28.0
+
+# Optional: youtube-transcript-api làm fallback
+# youtube-transcript-api>=0.6.0
+
+# Optional: OpenAI làm fallback
+# openai>=1.0.0
