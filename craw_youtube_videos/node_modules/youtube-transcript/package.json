@@ -1,0 +1,34 @@
+{
+  "name": "youtube-transcript",
+  "type": "module",
+  "version": "1.3.0",
+  "description": "Fetch transcript from a youtube video",
+  "main": "dist/youtube-transcript.common.js",
+  "browser": "dist/youtube-transcript.esm.js",
+  "module": "dist/youtube-transcript.esm.js",
+  "types": "dist/index.d.ts",
+  "author": "Kakulukian",
+  "keywords": [
+    "youtube",
+    "transcript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vite": "^8.0.0"
+  },
+  "files": [
+    "dist/*"
+  ],
+  "repository": "https://github.com/Kakulukian/youtube-transcript.git",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/Kakulukian/youtube-transcript",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "vite build && tsc --emitDeclarationOnly"
+  }
+}
