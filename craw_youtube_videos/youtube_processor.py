@@ -32,10 +32,20 @@ from http.cookiejar import MozillaCookieJar
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from pathlib import Path
+
+# Load .env NGAY LAP TUC truoc khi su dung bien moi truong
+from dotenv import load_dotenv
+load_dotenv()
+
+# Debug: In thong tin de kiem tra
+print(f"[DEBUG] MYSQL_HOST: {os.getenv('MYSQL_HOST')}")
+print(f"[DEBUG] MYSQL_USER: {os.getenv('MYSQL_USER')}")
+print(f"[DEBUG] MYSQL_PASSWORD: {os.getenv('MYSQL_PASSWORD')}")
+print(f"[DEBUG] MYSQL_DATABASE: {os.getenv('MYSQL_DATABASE')}")
+
 import mysql.connector
 from mysql.connector import Error
 import requests
-from dotenv import load_dotenv
 
 # --- CẤU HÌNH LOGGING ---
 import logging
