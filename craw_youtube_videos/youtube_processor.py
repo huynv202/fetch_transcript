@@ -36,8 +36,9 @@ from mysql.connector import Error
 import requests
 from dotenv import load_dotenv
 
-# Load biến môi trường từ file .env
-load_dotenv()
+# Load biến môi trường từ file .env (dùng đường dẫn tuyệt đối)
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+load_dotenv(dotenv_path=env_path)
 
 # ============================================================================
 # CẤU HÌNH
