@@ -1,0 +1,17 @@
+{
+  "name": "youtube-processor",
+  "version": "1.0.0",
+  "description": "Xử lý transcript YouTube, tạo quotes và bài đăng bằng AI (Qwen)",
+  "type": "module",
+  "main": "youtube_processor.js",
+  "scripts": {
+    "start": "node youtube_processor.js",
+    "process": "node youtube_processor.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "mysql2": "^3.6.5",
+    "youtube-transcript": "^1.2.0"
+  }
+}
